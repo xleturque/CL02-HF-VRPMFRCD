@@ -2,11 +2,14 @@
 """Interface Streamlit du projet HF-VRPMFRCD (CL02)."""
 import math
 from collections import defaultdict
-from analyses_cl02 import afficher_analyses
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-
+from analyses_cl02 import (
+    afficher_chronologie,
+    afficher_gain_optimisation,
+    afficher_analyse_experimentale,
+)
 from optimisation import (
     METHODES, classement, executer_comparaison, facteur_minutes, generer_dat,
     graphe_flux_simplifie, tableau_comparaison, tableau_tournees, tableau_transferts
@@ -16,16 +19,16 @@ from optimisation import (
 # COULEURS
 # =====================================================================
 COULEURS_METHODES = {
-    "SA": "#F28E2B",       # Orange
-    "SAVND": "#59A14F",    # Vert
-    "ANSA": "#4E79A7"      # Bleu
+    "SA": "#F28E2B",
+    "SAVND": "#59A14F",
+    "ANSA": "#4E79A7"
 }
 COULEURS_PROCESSUS = {
-    "P1": "#E15759",       # Rouge
-    "P2": "#F28E2B",       # Orange
-    "P3": "#D4A017",       # Jaune dore (lisible sur fond clair)
-    "P4": "#269DAB",       # Bleu-vert
-    "P5": "#9467BD"        # Violet
+    "P1": "#E15759",
+    "P2": "#F28E2B",
+    "P3": "#D4A017",
+    "P4": "#269DAB",
+    "P5": "#9467BD"
 }
 NOMS_PROCESSUS = {
     "P1": "P1 · Collecte fournisseurs",
@@ -257,6 +260,7 @@ with st.sidebar:
 # =====================================================================
 if lancer:
     st.session_state.pop("execution_cl02", None)
+    st.session_state.pop("cl02_repetitions_avancees", None)
     if not methodes:
         st.warning("Sélectionnez au moins une méthode avant de lancer le calcul.")
     else:
@@ -319,9 +323,26 @@ st.caption(
     "Temps des résultats affichés en minutes."
 )
 
-onglet_bilan, onglet_convergence, onglet_tournees, onglet_export = st.tabs(
-    ["Vue d'ensemble", "Convergence", "Tournées et transferts", "Données et export"]
-)
+# =====================================================================
+# 7 ONGLETS CENTRAUX
+# =====================================================================
+(
+    onglet_bilan,
+    onglet_convergence,
+    onglet_tournees,
+    onglet_chronologie,
+    onglet_gain,
+    onglet_export,
+    onglet_experimental,
+) = st.tabs([
+    "Vue d'ensemble",
+    "Convergence",
+    "Tournées et transferts",
+    "Chronologie",
+    "Gain de l'optimisation",
+    "Données et export",
+    "Analyse expérimentale",
+])
 
 # =====================================================================
 # ONGLET 1 - VUE D'ENSEMBLE
@@ -475,7 +496,19 @@ with onglet_tournees:
         st.caption("Temps exprimés en minutes depuis le début des opérations.")
 
 # =====================================================================
-# ONGLET 4 - DONNEES ET EXPORT
+# ONGLET 4 - CHRONOLOGIE
+# =====================================================================
+with onglet_chronologie:
+    afficher_chronologie(execution)
+
+# =====================================================================
+# ONGLET 5 - GAIN DE L'OPTIMISATION
+# =====================================================================
+with onglet_gain:
+    afficher_gain_optimisation(execution)
+
+# =====================================================================
+# ONGLET 6 - DONNEES ET EXPORT
 # =====================================================================
 with onglet_export:
     st.subheader("Données de l'instance et téléchargements")
@@ -512,9 +545,18 @@ with onglet_export:
             st.markdown("**Retours**")
             st.dataframe(pd.DataFrame(inst["pr"], columns=colonnes, index=lignes_flux), width="stretch")
 
+# =====================================================================
+# ONGLET 7 - ANALYSE EXPERIMENTALE
+# =====================================================================
+with onglet_experimental:
+    afficher_analyse_experimentale(execution)
+
+# =====================================================================
+# PIED DE PAGE
+# =====================================================================
 st.divider()
 st.caption(
     "CL02 · HF-VRPMFRCD · Résultats obtenus par les fonctions Python existantes. "
     "L'application ne remplace pas une vérification indépendante des contraintes du modèle exact."
 )
-afficher_analyses(execution)
+
