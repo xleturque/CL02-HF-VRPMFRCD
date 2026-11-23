@@ -527,7 +527,7 @@ def report(prob, A, unite_temps=""):
         print(f"Violations : charge={I['viol_units']:.1f}, temps={I['viol_time']:.1f}")
     return I
 
-SECONDES_PAR_METHODE = 30.0
+SECONDES_PAR_METHODE = 20
 
 def exporter_dat_pour_cplex(donnees, chemin, set_id, graine):
     """Export CPLEX avec conversion des temps en minutes."""
@@ -616,4 +616,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
