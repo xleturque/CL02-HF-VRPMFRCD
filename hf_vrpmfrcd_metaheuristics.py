@@ -193,6 +193,7 @@ class Problem:
         cache[cle] = result
         return result
 
+    
     def evaluate(self, A, detail=False):
         """Fonction objectif : coûts P1-P5 et pénalités."""
         nD, nW, zeta, Tmax = self.nD, self.nW, self.zeta, self.Tmax
@@ -203,7 +204,6 @@ class Problem:
         G3, I3, _, xi2, theta4, ld3, w3 = E3
         G5, I5, _, xi4, _, ld5, w5 = E5
         pen_units = w1 + w3 + w5
-        pen_time = 0.0
 
         G2, trucks2, flow2 = self._transfer(theta2, xi2)
         tau2 = tau1[:]
@@ -224,30 +224,60 @@ class Problem:
             if nt > nW:
                 pen_units += nt - nW
 
-        for dock, nodes, veh, cout, duree in I5:
-            fin = tau4[dock] + zeta + duree
-            if fin > Tmax:
-                pen_time += fin - Tmax
+        # Calcul de la durée totale des opérations P1 à P5
+        fins_p5 = [
+            tau4[dock] + zeta + duree
+            for dock, nodes, veh, cout, duree in I5
+        ]
+        duree_operations = max(
+            [0.0] + tau1[1:] + tau2[1:]
+            + tau3[1:] + tau4[1:] + fins_p5
+        )
+
+        # Pénalité temporelle sur la durée globale des opérations
+        pen_time = max(0.0, duree_operations - Tmax)
+
+        # Vérification des capacités des cross-docks
         for i in range(1, nD + 1):
             h = self.h[i]
-            pen_units += max(0.0, ld1[i] - h) + max(0.0, ld3[i] - h) + max(0.0, ld5[i] - h)
+            pen_units += (
+                max(0.0, ld1[i] - h)
+                + max(0.0, ld3[i] - h)
+                + max(0.0, ld5[i] - h)
+            )
 
+        # Fonction objectif : coût de transport + pénalités
         total = G1 + G2 + G3 + G4 + G5
         self.last_pen = self.pen_load * pen_units + self.pen_time * pen_time
         obj = total + self.last_pen
+
         if not detail:
             return obj
 
-        fins_p5 = [tau4[dock] + zeta + duree for dock, noeuds, veh, cout, duree in I5]
-        duree_operations = max([0.0] + tau4[1:] + fins_p5)
+        # Contrôle de faisabilité cohérent avec la durée calculée
+        respecte_tmax = (duree_operations <= Tmax + EPS)
         return dict(
-            obj=obj, cost=total, feasible=(pen_units < EPS and pen_time < EPS),
-            duree_operations=duree_operations, respecte_tmax=(duree_operations <= Tmax + EPS),
-            P1=I1, P3=I3, P5=I5,
+            obj=obj,
+            cost=total,
+            feasible=(pen_units < EPS and respecte_tmax),
+            duree_operations=duree_operations,
+            respecte_tmax=respecte_tmax,
+            P1=I1,
+            P3=I3,
+            P5=I5,
             G=dict(P1=G1, P2=G2, P3=G3, P4=G4, P5=G5),
-            trucks2=trucks2, trucks4=trucks4, flow2=flow2, flow4=flow4,
-            tau=dict(tau1=tau1[1:], tau2=tau2[1:], tau3=tau3[1:], tau4=tau4[1:]),
-            viol_units=pen_units, viol_time=pen_time
+            trucks2=trucks2,
+            trucks4=trucks4,
+            flow2=flow2,
+            flow4=flow4,
+            tau=dict(
+                tau1=tau1[1:],
+                tau2=tau2[1:],
+                tau3=tau3[1:],
+                tau4=tau4[1:]
+            ),
+            viol_units=pen_units,
+            viol_time=pen_time
         )
 
     def initial_solution(self, rng):
