@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 EPS = 1e-9
+VERSION_CONTROLE = "CL02-TMAX-2026-11-23-v2"
 
 # =====================================================================
 # 1. DONNEES ET FONCTION OBJECTIF
@@ -193,7 +194,6 @@ class Problem:
         cache[cle] = result
         return result
 
-    
     def evaluate(self, A, detail=False):
         """Fonction objectif : coûts P1-P5 et pénalités."""
         nD, nW, zeta, Tmax = self.nD, self.nW, self.zeta, self.Tmax
@@ -224,60 +224,42 @@ class Problem:
             if nt > nW:
                 pen_units += nt - nW
 
-        # Calcul de la durée totale des opérations P1 à P5
-        fins_p5 = [
-            tau4[dock] + zeta + duree
-            for dock, nodes, veh, cout, duree in I5
-        ]
-        duree_operations = max(
-            [0.0] + tau1[1:] + tau2[1:]
-            + tau3[1:] + tau4[1:] + fins_p5
-        )
-
-        # Pénalité temporelle sur la durée globale des opérations
-        pen_time = max(0.0, duree_operations - Tmax)
-
-        # Vérification des capacités des cross-docks
+        # Une seule definition de l'horizon, commune a la penalite et au rapport.
+        # Inclure P1/P2/P3/P4 meme si aucune tournee P5 ne part d'un dock.
+        fins_p5 = [tau4[dock] + zeta + duree
+                   for dock, nodes, veh, cout, duree in I5]
+        duree_operations = max([0.0] + tau1[1:] + tau2[1:]
+                               + tau3[1:] + tau4[1:] + fins_p5)
+        if not math.isfinite(duree_operations) or not math.isfinite(Tmax):
+            raise ValueError("Horizon temporel invalide : NaN ou infini.")
+        depassement_brut = max(0.0, duree_operations - Tmax)
+        respecte_tmax = depassement_brut <= EPS
+        pen_time = 0.0 if respecte_tmax else depassement_brut
         for i in range(1, nD + 1):
             h = self.h[i]
-            pen_units += (
-                max(0.0, ld1[i] - h)
-                + max(0.0, ld3[i] - h)
-                + max(0.0, ld5[i] - h)
-            )
+            pen_units += max(0.0, ld1[i] - h) + max(0.0, ld3[i] - h) + max(0.0, ld5[i] - h)
 
-        # Fonction objectif : coût de transport + pénalités
         total = G1 + G2 + G3 + G4 + G5
         self.last_pen = self.pen_load * pen_units + self.pen_time * pen_time
         obj = total + self.last_pen
-
         if not detail:
             return obj
 
-        # Contrôle de faisabilité cohérent avec la durée calculée
-        respecte_tmax = (duree_operations <= Tmax + EPS)
+        feasible = (pen_units < EPS and respecte_tmax)
+        # Verification explicite de la coherence avant toute diffusion des resultats.
+        if feasible != (pen_units < EPS and duree_operations <= Tmax + EPS):
+            raise RuntimeError("Faisabilite incoherente avec les contraintes")
+        if duree_operations > Tmax + EPS and pen_time <= EPS:
+            raise RuntimeError("Depassement de Tmax sans penalite temporelle")
         return dict(
-            obj=obj,
-            cost=total,
-            feasible=(pen_units < EPS and respecte_tmax),
-            duree_operations=duree_operations,
-            respecte_tmax=respecte_tmax,
-            P1=I1,
-            P3=I3,
-            P5=I5,
+            obj=obj, cost=total, feasible=feasible,
+            duree_operations=duree_operations, respecte_tmax=respecte_tmax,
+            P1=I1, P3=I3, P5=I5,
             G=dict(P1=G1, P2=G2, P3=G3, P4=G4, P5=G5),
-            trucks2=trucks2,
-            trucks4=trucks4,
-            flow2=flow2,
-            flow4=flow4,
-            tau=dict(
-                tau1=tau1[1:],
-                tau2=tau2[1:],
-                tau3=tau3[1:],
-                tau4=tau4[1:]
-            ),
-            viol_units=pen_units,
-            viol_time=pen_time
+            trucks2=trucks2, trucks4=trucks4, flow2=flow2, flow4=flow4,
+            tau=dict(tau1=tau1[1:], tau2=tau2[1:], tau3=tau3[1:], tau4=tau4[1:]),
+            viol_units=pen_units, viol_time=pen_time,
+            depassement_tmax=pen_time,
         )
 
     def initial_solution(self, rng):
@@ -584,6 +566,8 @@ def main():
     from hf_vrpmfrcd_instances import UNITES_TEMPS, generate_instance, summary
     print("=" * 65)
     print("CL02 - Comparaison SA / SAVND / ANSA")
+    print("Version controle :", VERSION_CONTROLE)
+    print("Fichier execute :", Path(__file__).resolve())
     print("=" * 65)
     set_id = demander_entier("Choisir un Set (1 à 5, 0 pour quitter) : ", 0, 5)
     if set_id == 0:
@@ -601,10 +585,24 @@ def main():
         solution, score, _, statistiques = solve(prob, methode, reglages)
         duree = time.perf_counter() - debut
         details = prob.evaluate(solution, detail=True)
+        # Double controle des valeurs qui alimentent la console et Streamlit.
+        attendu = (details["viol_units"] < EPS and
+                   details["duree_operations"] <= prob.Tmax + EPS)
+        if details["feasible"] != attendu:
+            raise RuntimeError("Evaluation finale incoherente avec Tmax")
+        if not math.isclose(details["obj"], score, rel_tol=1e-8, abs_tol=1e-6):
+            raise RuntimeError("Score du solveur different du score reevalue")
+        if details["duree_operations"] > prob.Tmax + EPS and (details["viol_time"] <= EPS or details["feasible"]):
+            raise RuntimeError("Depassement de Tmax non penalise")
         resultats.append((methode, solution, details, duree, statistiques))
-        print(f"{methode.upper():6s} coût={details['cost']:.2f} | faisable={details['feasible']} | calcul={duree:.2f} s")
-        if not details["feasible"]:
-            print(f"Objectif pénalisé = {score:.2f}")
+        print(
+            f"{methode.upper():6s} | coût={details['cost']:.2f} | "
+            f"objectif={details['obj']:.2f} | faisable={details['feasible']} | "
+            f"opérations={details['duree_operations']:.1f} {unite_temps} "
+            f"/ Tmax={prob.Tmax:g} {unite_temps} | "
+            f"dépassement={details['viol_time']:.1f} {unite_temps} | "
+            f"calcul={duree:.2f} s"
+        )
 
     valides = [res for res in resultats if res[2]["feasible"]]
     meilleur = min(valides, key=lambda res: res[2]["cost"]) if valides else min(resultats, key=lambda res: res[2]["obj"])
