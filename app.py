@@ -2,7 +2,7 @@
 """Interface Streamlit du projet HF-VRPMFRCD (CL02)."""
 import math
 from collections import defaultdict
-
+from analyses_cl02 import afficher_analyses
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -517,3 +517,4 @@ st.caption(
     "CL02 · HF-VRPMFRCD · Résultats obtenus par les fonctions Python existantes. "
     "L'application ne remplace pas une vérification indépendante des contraintes du modèle exact."
 )
+afficher_analyses(execution)
