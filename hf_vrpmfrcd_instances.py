@@ -2,15 +2,14 @@
 hf_vrpmfrcd_instances.py : generateur des instances 1 a 5 de l'article
 (Yu, Anh, Gunawan, Han, 2024, Expert Systems With Applications 237, 121631 -- Tableau 2).
 
-    from hf_vrpmfrcd_instances import generate_instance, write_dat
+    from hf_vrpmfrcd_instances import generate_instance
     inst = generate_instance(2, seed=1)             # Set 2 ; renvoie un dict aux noms OPL
-    write_dat(inst, "set2.dat", facteur_temps=1, unite_source="min")  # export CPLEX en minutes
 
-    python hf_vrpmfrcd_instances.py --set 3 --seed 1 --dat set3.dat
+    python hf_vrpmfrcd_instances.py --set 3 --seed 1
 
 Le dict renvoye contient : nC nD nS nV nW  bigM tmax zeta  c1 t1 c2 t2 cD tD  df pr  hD
 qV uV qsetW usetW  (matrices en listes de listes 0-indexees). Il se passe tel quel a
-Problem(**inst) (metaheuristiques) ; le solveur Gurobi le convertit en dictionnaires 1-indexes.
+Problem(**inst) (metaheuristiques) et a resoudre_cplex(inst, limite_temps=...) (CPLEX).
 
 DONNEES DE L'ARTICLE (Tableau 2) -- les 30 instances reelles ne sont pas publiees : on regenere
 des instances tirees selon les memes lois (graine = reproductibilite).
@@ -49,11 +48,10 @@ import random
 TYPED_FLEET = dict(q=(4000.0, 12500.0, 26000.0), u=(12.00, 13.66, 16.86))     # types L, M, H
 
 # Unites utilisees pour les temps de trajet, zeta, tmax et bigM en Python.
-# Les fichiers .dat pour CPLEX utilisent toujours les minutes.
-# Le second element est le facteur de conversion des temps Python vers les minutes.
+# Le tuple conserve l acces UNITES_TEMPS[set_id][0] des metaheuristiques.
 UNITES_TEMPS = {
-    1: ("min", 1), 2: ("min", 1), 3: ("min", 1),
-    4: ("h", 60), 5: ("h", 60),
+    1: ("min",), 2: ("min",), 3: ("min",),
+    4: ("h",), 5: ("h",),
 }
 
 SETS = {
@@ -75,23 +73,20 @@ SETS = {
 # ----------------------------------------------------------------------
 def _matrix(rg, n, lo, hi, nd=1):
     """Matrice n x n, diagonale nulle, valeurs ~ U(lo, hi) arrondies."""
-    return [[0.0 if i == j else round(rg.uniform(lo, hi), nd) for j in range(n)] for i in range(n)]
+    # Meme ordre des tirages (ligne puis colonne, sans tirage diagonal).
+    uniform = rg.uniform
+    indices = range(n)
+    return [[0.0 if i == j else round(uniform(lo, hi), nd) for j in indices]
+            for i in indices]
 
 
 def _partition(rg, total, k):
     """Entier -> k entiers >= 0 de somme total (repartition aleatoire)."""
-    cuts = sorted(rg.randint(0, total) for _ in range(k - 1))
-    parts = [b - a for a, b in zip([0] + cuts, cuts + [total])]
+    cuts = [rg.randint(0, total) for _ in range(k - 1)]
+    cuts.sort()
+    cuts.append(total)
+    parts = [b - a for a, b in zip([0] + cuts, cuts)]
     rg.shuffle(parts)
-    return parts
-
-
-def _split(rg, total, k, nd=2):
-    """Reel -> k reels >= 0 de somme ~ total."""
-    w = [rg.random() for _ in range(k)]
-    s = sum(w) or 1.0
-    parts = [round(total * x / s, nd) for x in w]
-    parts[-1] = max(0.0, round(total - sum(parts[:-1]), nd))
     return parts
 
 
@@ -110,8 +105,16 @@ def _fleet(rg, spec, nV=None):
 def _network(rg, spec, nD, nS, nC):
     """Couts / temps de trajet des graphes G1 (docks + fournisseurs), G2 (docks + clients), docks."""
     lo, hi = spec["dist"]
-    graph = lambda n: (lambda c: (c, _matrix(rg, n, *spec["time"]) if spec["time"]
-                                  else [[round(x / 60, 4) for x in row] for row in c]))(_matrix(rg, n, lo, hi))
+    def graph(n):
+        c = _matrix(rg, n, lo, hi)
+        if spec["time"]:
+            t = _matrix(rg, n, *spec["time"])
+        else:
+            # Les distances sont arrondies au dixieme. De nombreuses valeurs
+            # se repetent : ne calculer la conversion en heures qu'une fois.
+            conversion = {x: round(x / 60, 4) for x in {x for row in c for x in row}}
+            t = [[conversion[x] for x in row] for row in c]
+        return c, t
     c1, t1 = graph(nD + nS)
     c2, t2 = graph(nD + nC)
     for i in range(nD):                         # memes trajets entre cross-docks dans G1 et G2 (H7)
@@ -135,23 +138,17 @@ def _returns(rg, spec, df, nC, nS, mode):
     p'_ij ~ U_discrete(0, floor(max_j(d_ij) / 2))
     Les quantités retournées sont des entiers.
     """
+    randint = rg.randint
+    indices = range(nS)
     pr = []
     for i in range(nC):
-        # Demande maximale du client i parmi les fournisseurs
-        demande_max = max(df[i])
-        # Borne supérieure des retours
-        retour_max = demande_max // 2
-        # Tirage uniforme entier pour chaque fournisseur
-        retours_client = [
-            rg.randint(0, retour_max)
-            for j in range(nS)
-        ]
-        pr.append(retours_client)
+        retour_max = max(df[i]) // 2
+        pr.append([randint(0, retour_max) for _ in indices])
     return pr
 
 
 def _check(inst):
-    """Controle de coherence des dimensions (evite les .dat incoherents)."""
+    """Controle de coherence des dimensions des instances."""
     nC, nD, nS, nV = inst["nC"], inst["nD"], inst["nS"], inst["nV"]
     shapes = dict(c1=(nD + nS,) * 2, t1=(nD + nS,) * 2, c2=(nD + nC,) * 2, t2=(nD + nC,) * 2,
                   cD=(nD, nD), tD=(nD, nD), df=(nC, nS), pr=(nC, nS))
@@ -219,96 +216,12 @@ def summary(inst, set_id=None):
             f"flux aller={sum(map(sum, inst['df'])):g}  retours={sum(map(sum, inst['pr'])):.1f}")
 
 
-def write_dat(inst, path, title="", facteur_temps=1, unite_source="min"):
-    """Ecrit un fichier OPL .dat lisible, avec tous les temps en minutes.
-
-    facteur_temps=1 pour les Sets 1-3 (temps Python en minutes),
-    facteur_temps=60 pour les Sets 4-5 (temps Python en heures).
-    Les paramètres t1, t2, tD, zeta, tmax et bigM sont convertis ensemble.
-    La génération initiale, les distances, les coûts et les quantités ne changent pas.
-    Chaque rangée de matrice occupe sa propre ligne dans le fichier.
-    """
-    if facteur_temps <= 0:
-        raise ValueError("facteur_temps doit etre strictement positif")
-    sortie = dict(inst)
-    for cle in ("tmax", "zeta", "bigM"):
-        sortie[cle] = inst[cle] * facteur_temps
-    for cle in ("t1", "t2", "tD"):
-        sortie[cle] = [[val * facteur_temps for val in ligne] for ligne in inst[cle]]
-
-    def fmt(x):
-        """Nombre OPL sans longues erreurs d'arrondi binaire."""
-        valeur = float(x)
-        return str(int(valeur)) if valeur.is_integer() else format(valeur, ".12g")
-
-    def vec(valeurs):
-        return "[" + ", ".join(fmt(x) for x in valeurs) + "]"
-
-    def mat(nom, matrice):
-        """Une rangée par ligne ; indentation sous la première rangée."""
-        marge = " " * (len(nom) + 5)
-        lignes = (",\n" + marge).join(vec(ligne) for ligne in matrice)
-        return "[ " + lignes + " ]"
-
-    lines = [
-        f"/* Instance HF-VRPMFRCD {title} : {summary(inst)}",
-        "   Unite temporelle du fichier : minutes (pour tous les sets).",
-        f"   Unite temporelle des calculs Python : {unite_source}. */",
-        "",
-        "// Dimensions du probleme",
-    ]
-    for k in ("nC", "nD", "nS", "nV", "nW"):
-        lines.append(f"{k} = {sortie[k]};")
-
-    lines += [
-        "",
-        "// Parametres temporels (minutes)",
-        f"tmax = {fmt(sortie['tmax'])}; // Horizon maximal des operations",
-        f"zeta = {fmt(sortie['zeta'])}; // Temps d'activite au cross-dock",
-        f"bigM = {fmt(sortie['bigM'])}; // Grande constante du modele",
-        "",
-        "// Flotte de vehicules et capacites des cross-docks",
-        f"qV = {vec(sortie['qV'])}; // Capacites des vehicules heterogenes",
-        f"uV = {vec(sortie['uV'])}; // Couts unitaires de transport",
-        f"qsetW = {fmt(sortie['qsetW'])}; // Capacite des vehicules de transfert",
-        f"usetW = {fmt(sortie['usetW'])}; // Cout unitaire des transferts",
-        f"hD = {vec(sortie['hD'])}; // Capacites des cross-docks",
-        "",
-        "// Flux aller : lignes = clients, colonnes = fournisseurs",
-        f"df = {mat('df', sortie['df'])};",
-        "",
-        "// Flux retour : lignes = clients, colonnes = fournisseurs",
-        f"pr = {mat('pr', sortie['pr'])};",
-        "",
-        "// G1 : cross-docks et fournisseurs (couts, puis temps en minutes)",
-        f"c1 = {mat('c1', sortie['c1'])};",
-        f"t1 = {mat('t1', sortie['t1'])};",
-        "",
-        "// G2 : cross-docks et clients (couts, puis temps en minutes)",
-        f"c2 = {mat('c2', sortie['c2'])};",
-        f"t2 = {mat('t2', sortie['t2'])};",
-        "",
-        "// Liaisons entre cross-docks (couts, puis temps en minutes)",
-        f"cD = {mat('cD', sortie['cD'])};",
-        f"tD = {mat('tD', sortie['tD'])};",
-        "",
-    ]
-    with open(path, "w", encoding="utf-8") as fichier:
-        fichier.write("\n".join(lines))
-
-
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Generateur des instances 1 a 5 de l'article")
     ap.add_argument("--set", type=int, default=1, choices=sorted(SETS))
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--variant", type=int, default=0, help="Set 4 : 0 = (85 C, 15 S), 1 = (15 C, 85 S)")
     ap.add_argument("--returns", choices=["text"], default="text")
-    ap.add_argument("--dat", help="ecrire l'instance au format OPL .dat")
     a = ap.parse_args()
     inst = generate_instance(a.set, a.seed, a.variant, returns=a.returns)
     print(f"Set {a.set}, graine {a.seed} : {summary(inst, a.set)}")
-    if a.dat:
-        unite, facteur = UNITES_TEMPS[a.set]
-        write_dat(inst, a.dat, f"Set {a.set} (graine {a.seed})",
-                  facteur_temps=facteur, unite_source=unite)
-        print("ecrit :", a.dat)
