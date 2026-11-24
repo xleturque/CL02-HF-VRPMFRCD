@@ -11,37 +11,36 @@ afficher_analyse_experimentale puis les appeler dans les onglets centraux.
 
 from __future__ import annotations
 
-import random
 from statistics import mean, pstdev
-from time import perf_counter
 from typing import Callable, Optional
 
 import pandas as pd
 import plotly.graph_objects as go
 
-from hf_vrpmfrcd_metaheuristics import Problem, quick_params, solve
-
-COLORS_METHOD = {"SA": "#F28E2B", "SAVND": "#59A14F", "ANSA": "#4E79A7"}
-COLORS_PHASE = {"P1": "#E15759", "P2": "#F28E2B", "P3": "#D4A017", "P4": "#269DAB", "P5": "#9467BD"}
-
-
-def _facteur_minutes(execution: dict) -> float:
-    from hf_vrpmfrcd_instances import UNITES_TEMPS
-    return float(UNITES_TEMPS[execution["set_id"]][1])
+from hf_vrpmfrcd_metaheuristics import Problem
+from optimisation import (HEURISTIQUES, COULEURS_METHODES as COLORS_METHOD,
+                          COULEURS_PROCESSUS as COLORS_PHASE, facteur_minutes,
+                          executer_heuristique)
 
 
-def analyser_gain_initial(execution: dict, seed_recherche: int = 0) -> list[dict]:
+def _facteur_minutes(execution):
+    return facteur_minutes(execution['set_id'])
+
+
+def analyser_gain_initial(execution: dict) -> list[dict]:
     """Reference brute de initial_solution(), avant reparation/recuit.
 
     Les executions ordinaires de l'app utilisent seed_recherche=0. On compare
     l'objectif penalise meme si la solution initiale est infaisable ; le gain
     de cout de transport n'est montre que si les deux solutions sont faisables.
     """
-    prob = Problem(**execution["donnees"])
-    a0, _ = prob.initial_solution(random.Random(seed_recherche))
-    debut = prob.evaluate(a0, detail=True)
+    debut = execution.get("initial")
+    if debut is None:
+        return []
     lignes = []
     for resultat in execution["resultats"]:
+        if resultat["methode"] not in HEURISTIQUES:
+            continue
         fin = resultat["details"]
         obj0, objf = float(debut["obj"]), float(fin["obj"])
         cout0, coutf = float(debut["cost"]), float(fin["cost"])
@@ -77,6 +76,8 @@ def construire_chronologie(execution: dict, resultat: dict) -> list[dict]:
     Les camions d'une meme liaison de transfert sont representes par une barre
     agregee (pas une planification individuelle des vehicules).
     """
+    if resultat["methode"] == "CPLEX":
+        return []  # Le Gantt heuristique ne décrit pas le MILP.
     inst = execution["donnees"]
     details = resultat["details"]
     f = _facteur_minutes(execution)
@@ -143,15 +144,13 @@ def executer_repetitions(
     progression: Optional[Callable[[int, int, str], None]] = None,
 ) -> list[dict]:
     """Repete les methodes sur la MEME instance avec graines de recherche 0..n-1."""
-    valides = {"SA", "SAVND", "ANSA"}
+    valides = set(HEURISTIQUES)
     if not methodes or any(m not in valides for m in methodes):
         raise ValueError("Veuillez choisir au moins une des methodes SA/SAVND/ANSA.")
-    if not 2 <= repetitions <= 10:
-        raise ValueError("Le nombre de repetitions doit etre compris entre 2 et 10.")
-    if not 0.1 <= secondes <= 15:
-        raise ValueError("Le budget par execution doit etre compris entre 0,1 et 15 secondes.")
-    if repetitions * secondes * len(methodes) > 150:
-        raise ValueError("Budget cumule trop eleve pour l'hebergement public (maximum 150 s).")
+    if not 2 <= repetitions <= 1000:
+        raise ValueError("Le nombre de répétitions doit être compris entre 2 et 1000.")
+    if not 0 < float(secondes) < float('inf'):
+        raise ValueError("Le budget par exécution doit être positif et fini.")
 
     prob = Problem(**execution["donnees"])
     lignes = []
@@ -160,11 +159,10 @@ def executer_repetitions(
     # Par repetition, comparer les trois methodes avec la meme graine de recherche.
     for seed in range(repetitions):
         for methode in methodes:
-            params = quick_params(prob, seed=seed, time_limit=float(secondes))
-            debut = perf_counter()
-            solution, score, hist, stats = solve(prob, methode.lower(), params)
-            duree = perf_counter() - debut
-            details = prob.evaluate(solution, detail=True)
+            r = executer_heuristique(prob, methode, secondes, seed)
+            details = r['details']
+            duree = r['duree_calcul']
+            stats = r['statistiques']
             lignes.append({
                 "Méthode": methode,
                 "Graine recherche": seed,
@@ -214,27 +212,31 @@ def afficher_analyse_experimentale(execution: dict) -> None:
         "du recuit change d'une répétition à l'autre. Les coûts statistiques ne "
         "concernent que les solutions déclarées faisables."
     )
-    presentes = [r["methode"] for r in execution["resultats"]]
+    presentes = [r["methode"] for r in execution["resultats"] if r["methode"] in HEURISTIQUES]
+    if not presentes:
+        st.info("Analyse réservée aux métaheuristiques.")
+        return
+    precedent = st.session_state.get("cl02_repetitions_avancees")
+    anciens = precedent["signature"] if precedent else None
+    defaut_methodes = [m for m in anciens[2] if m in presentes] if anciens else presentes
     with st.form("cl02_form_analyse_experimentale"):
         c1, c2, c3 = st.columns([1.1, 1, 1])
         with c1:
-            methodes = st.multiselect("Méthodes", presentes, default=presentes,
+            methodes = st.multiselect("Méthodes", presentes, default=defaut_methodes,
                                      key="adv_methodes")
         with c2:
-            repetitions = st.select_slider("Répétitions par méthode", options=[3, 5, 10],
-                                           value=5, key="adv_repetitions")
+            repetitions = st.number_input("Répétitions par méthode", min_value=2, max_value=1000,
+                                           value=int(anciens[3]) if anciens else 5, step=1, key="adv_repetitions")
         with c3:
-            budget = st.select_slider("Budget par essai (s)", options=[3, 5, 10, 15],
-                                      value=5, key="adv_budget")
+            budget = st.number_input("Budget par essai (s)", min_value=0.1,
+                                      value=float(anciens[4]) if anciens else 5.0, step=1.0, key="adv_budget")
         total = repetitions * len(methodes) * budget
-        st.caption(f"Budget théorique maximal cumulé : {total} s (plafond : 150 s).")
+        st.caption(f"Budget théorique maximal cumulé : {total} s hors préparation et post-traitement.")
         lancer = st.form_submit_button("Lancer les répétitions", type="primary")
     signature = (execution["set_id"], execution["graine"], tuple(methodes), repetitions, budget)
     if lancer:
         if not methodes:
             st.warning("Choisissez au moins une méthode.")
-        elif total > 150:
-            st.warning("Réduisez le nombre de répétitions, le temps ou le nombre de méthodes (maximum 150 s cumulées).")
         else:
             st.session_state.pop("cl02_repetitions_avancees", None)
             bar = st.progress(0.0, text="Calculs expérimentaux")
@@ -336,14 +338,38 @@ def afficher_chronologie(execution: dict) -> None:
     """Onglet central : chronologie macro des phases P1–P5."""
     import streamlit as st
     st.subheader("Chronologie des processus logistiques")
-    st.caption("Visualisation synthétique des cinq processus et des préparations P3/P5.")
-    resultats = execution["resultats"]
+    st.caption("Chronologie des métaheuristiques ou jalons temporels du MILP.")
+    resultats = [r for r in execution["resultats"] if r["solution_disponible"]]
+    if not resultats:
+        st.info("Aucune solution à représenter.")
+        return
     methode = st.selectbox("Méthode à représenter", [r["methode"] for r in resultats],
                            key="cl02_methode_gantt_simple")
     resultat = next(r for r in resultats if r["methode"] == methode)
     details = resultat["details"]
     f = _facteur_minutes(execution)
     tmax = float(execution["donnees"]["tmax"]) * f
+    if methode == "CPLEX":
+        duree = details.get("duree_operations")
+        c1, c2 = st.columns(2)
+        c1.metric("Fin P5 (post-traitement)", f"{duree*f:,.1f} min" if duree is not None else "—")
+        c2.metric("Horizon Tmax", f"{tmax:,.1f} min")
+        tau = details.get("tau")
+        if tau is None:
+            st.info("Dates CPLEX indisponibles : le post-traitement temporel n'a pas fourni de solution.")
+            return
+        st.caption("Dates tau du post-traitement CPLEX (jalons, pas intervalles d'activité). Les contraintes OPL ne déterminent pas tous les départs et temps d'attente ; aucun Gantt heuristique n'est imputé à CPLEX.")
+        fig = go.Figure()
+        for k, phase in enumerate(("P1", "P2", "P3", "P4"), 1):
+            fig.add_trace(go.Scatter(x=[v*f for v in tau[f"tau{k}"]],
+                y=[f"D{i+1}" for i in range(len(tau[f"tau{k}"]))], mode="markers", name=f"tau{k}",
+                marker=dict(size=12,color=COLORS_PHASE[phase]), hovertemplate="%{y} : %{x:.2f} min<extra></extra>"))
+        fig.add_vline(x=tmax,line_dash="dash",annotation_text="Tmax")
+        fig.update_layout(xaxis_title="Temps (min)",height=350,legend=dict(orientation="h"))
+        st.plotly_chart(fig,use_container_width=True)
+        st.dataframe(pd.DataFrame({"Cross-dock":[f"D{i+1}" for i in range(len(tau["tau1"]))],
+            **{k:[round(v*f,3) for v in vals] for k,vals in tau.items()}}),hide_index=True)
+        return
     duree = float(details["duree_operations"]) * f
     marge = tmax - duree
     a, b, c = st.columns(3)
@@ -410,7 +436,7 @@ def afficher_gain_optimisation(execution: dict) -> None:
     import streamlit as st
     st.subheader("Gain apporté par l'optimisation")
     st.caption("Construction initiale → réparation → recuit. Les valeurs sont des objectifs pénalisés, pas nécessairement des coûts de transport.")
-    lignes = analyser_gain_initial(execution, seed_recherche=0)
+    lignes = analyser_gain_initial(execution)
     if not lignes:
         st.info("Aucune méthode à comparer.")
         return
@@ -477,8 +503,3 @@ def afficher_gain_optimisation(execution: dict) -> None:
         )
     else:
         st.caption("La baisse de l'objectif correspond à une réduction des coûts lorsque les solutions comparées sont toutes faisables.")
-
-
-def afficher_analyses(execution: dict) -> None:
-    """Compatibilité avec l'ancien appel : n'affiche plus que l'expérimental."""
-    afficher_analyse_experimentale(execution)
