@@ -7,23 +7,21 @@ Reference : Yu, Anh, Gunawan et Han (2024), Expert Systems with Applications.
 
 Mode d'emploi dans Spyder :
     - Executer ce fichier (F5) sans argument de ligne de commande.
-    - Saisir le numero du set (1 a 5) et la graine de generation.
+    - Saisir le numero du set (1 a 5), la graine de generation et la duree
+      maximale de calcul par methode.
     - Consulter les resultats des trois methodes sur la meme instance.
-    - En fin d'execution, choisir ou non d'exporter les donnees vers CPLEX.
 
 La comparaison interactive utilise une execution par methode, avec un budget
-de 30 secondes par methode. Les parametres complets de l'article sont definis
+saisi dans la console. Les parametres complets de l'article sont definis
 par paper_params() pour des campagnes experimentales approfondies.
 """
 import math
 import random
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
 EPS = 1e-9
-VERSION_CONTROLE = "CL02-TMAX-2026-11-23-v2"
 
 # =====================================================================
 # 1. DONNEES ET FONCTION OBJECTIF
@@ -79,7 +77,17 @@ class Problem:
         for c in C:
             self.load3[nD + c] = self.dtot[c]
         self.nZ = nV
+        # Caches bornes, propres a cette instance. Les cles ne contiennent
+        # que des donnees immuables ; aucune solution ni matrice n'est modifiee.
         self._cache_phases = {1: {}, 3: {}, 5: {}}
+        self._cache_routes = {1: {}, 3: {}, 5: {}}
+        self._cache_transferts = {}
+        # Ne parcourir que les flux non nuls, dans l'ordre initial.
+        self._flux_clients = [()] + [
+            tuple((k, self.d[c][k], self.pret[c][k]) for k in S
+                  if self.d[c][k] != 0 or self.pret[c][k] != 0)
+            for c in C
+        ]
 
     def _decode(self, r, vl, load):
         nD, Q, nveh = self.nD, self.Q, len(vl)
@@ -124,7 +132,12 @@ class Problem:
     def _transfer(self, theta, xi):
         """Transferts P2/P4 : coût, camions et quantités par liaison."""
         nD, nS, cD = self.nD, self.nS, self.cD
-        delta = [[theta[i][j] - xi[i][j] for j in range(nS + 1)] for i in range(nD + 1)]
+        if nD == 1 or theta == xi:
+            return 0.0, {}, {}
+        delta = [[0.0] * (nS + 1)] + [
+            [0.0] + [a - b for a, b in zip(theta[i][1:], xi[i][1:])]
+            for i in range(1, nD + 1)
+        ]
         flow = {}
         for i in range(1, nD + 1):
             for j in range(1, nS + 1):
@@ -150,15 +163,40 @@ class Problem:
             cost += cD[i][h] * self.uW * n
         return cost, trucks, flow
 
+    def _transfer_cached(self, theta, xi):
+        """Memorise les transferts pour les memes flux (independamment des tournees)."""
+        if self.nD == 1 or theta == xi:
+            return 0.0, {}, {}
+        cache = self._cache_transferts
+        cle = (theta, xi)
+        result = cache.get(cle)
+        if result is None:
+            result = self._transfer(theta, xi)
+            if len(cache) >= 1024:
+                cache.clear()
+            cache[cle] = result
+        return result
+
     def _phase(self, numero, routes_tableau, vehicules_tableau):
         """Evaluation mise en cache de P1, P3 ou P5."""
         cache = self._cache_phases[numero]
         cle = (tuple(routes_tableau), tuple(vehicules_tableau))
-        if cle in cache:
-            return cache[cle]
+        result = cache.get(cle)
+        if result is not None:
+            return result
         nD, nS = self.nD, self.nS
         charge = self.load3 if numero == 3 else self.load1 if numero == 1 else self.load5
         R, violations = self._decode(routes_tableau, vehicules_tableau, charge)
+        # Les permutations des vehicules inutilises et les separateurs
+        # redondants peuvent representer exactement les memes tournees.
+        cache_routes = self._cache_routes[numero]
+        cle_routes = (tuple((dock, tuple(nodes), veh) for dock, nodes, veh in R), violations)
+        result = cache_routes.get(cle_routes)
+        if result is not None:
+            if len(cache) >= 1024:
+                cache.clear()
+            cache[cle] = result
+            return result
         distances, temps = (self.c2, self.t2) if numero == 3 else (self.c1, self.t1)
         flux = [[0.0] * (nS + 1) for _ in range(nD + 1)]
         retours = [[0.0] * (nS + 1) for _ in range(nD + 1)] if numero == 3 else None
@@ -184,12 +222,18 @@ class Problem:
                     chargements_dock[dock] += q
                 else:
                     chargements_dock[dock] += self.dtot[j]
-                    commandes, invendus = self.d[j], self.pret[j]
-                    for k in range(1, nS + 1):
-                        flux[dock][k] += commandes[k]
-                        retours[dock][k] += invendus[k]
+                    for k, commande, retour in self._flux_clients[j]:
+                        flux[dock][k] += commande
+                        retours[dock][k] += retour
+        # Une representation immuable evite de reconstruire les cles de transfert.
+        flux = tuple(map(tuple, flux))
+        if retours is not None:
+            retours = tuple(map(tuple, retours))
         result = (cout_total, infos, fin_tournee, flux, retours, chargements_dock, violations)
-        if len(cache) >= 256:
+        if len(cache_routes) >= 1024:
+            cache_routes.clear()
+        cache_routes[cle_routes] = result
+        if len(cache) >= 1024:
             cache.clear()
         cache[cle] = result
         return result
@@ -205,7 +249,7 @@ class Problem:
         G5, I5, _, xi4, _, ld5, w5 = E5
         pen_units = w1 + w3 + w5
 
-        G2, trucks2, flow2 = self._transfer(theta2, xi2)
+        G2, trucks2, flow2 = self._transfer_cached(theta2, xi2)
         tau2 = tau1[:]
         for (i, k), nt in trucks2.items():
             tau2[k] = max(tau2[k], tau1[i] + self.tD[i][k])
@@ -217,7 +261,7 @@ class Problem:
             fin = tau2[dock] + zeta + duree
             tau3[dock] = max(tau3[dock], fin)
 
-        G4, trucks4, flow4 = self._transfer(theta4, xi4)
+        G4, trucks4, flow4 = self._transfer_cached(theta4, xi4)
         tau4 = tau3[:]
         for (i, k), nt in trucks4.items():
             tau4[k] = max(tau4[k], tau3[i] + self.tD[i][k])
@@ -226,10 +270,10 @@ class Problem:
 
         # Une seule definition de l'horizon, commune a la penalite et au rapport.
         # Inclure P1/P2/P3/P4 meme si aucune tournee P5 ne part d'un dock.
-        fins_p5 = [tau4[dock] + zeta + duree
-                   for dock, nodes, veh, cout, duree in I5]
-        duree_operations = max([0.0] + tau1[1:] + tau2[1:]
-                               + tau3[1:] + tau4[1:] + fins_p5)
+        # tau2 domine tau1 et tau4 domine tau3 par construction.
+        duree_operations = max(max(tau2), max(tau4))
+        for dock, nodes, veh, cout, duree in I5:
+            duree_operations = max(duree_operations, tau4[dock] + zeta + duree)
         if not math.isfinite(duree_operations) or not math.isfinite(Tmax):
             raise ValueError("Horizon temporel invalide : NaN ou infini.")
         depassement_brut = max(0.0, duree_operations - Tmax)
@@ -254,9 +298,12 @@ class Problem:
         return dict(
             obj=obj, cost=total, feasible=feasible,
             duree_operations=duree_operations, respecte_tmax=respecte_tmax,
-            P1=I1, P3=I3, P5=I5,
+            P1=[(d, list(nodes), v, c, t) for d, nodes, v, c, t in I1],
+            P3=[(d, list(nodes), v, c, t) for d, nodes, v, c, t in I3],
+            P5=[(d, list(nodes), v, c, t) for d, nodes, v, c, t in I5],
             G=dict(P1=G1, P2=G2, P3=G3, P4=G4, P5=G5),
-            trucks2=trucks2, trucks4=trucks4, flow2=flow2, flow4=flow4,
+            trucks2=trucks2.copy(), trucks4=trucks4.copy(),
+            flow2=flow2.copy(), flow4=flow4.copy(),
             tau=dict(tau1=tau1[1:], tau2=tau2[1:], tau3=tau3[1:], tau4=tau4[1:]),
             viol_units=pen_units, viol_time=pen_time,
             depassement_tmax=pen_time,
@@ -509,41 +556,58 @@ def solve(prob, method="savnd", P=None):
     return best, fbest, hist, info
 
 # =====================================================================
-# 4. AFFICHAGE ET EXPORT
+# 4. SAISIE ET AFFICHAGE
 # =====================================================================
-def report(prob, A, unite_temps=""):
+def report(prob, A, unite_temps="", methode=None, duree=None):
+    """Affiche la meilleure solution dans un format commun au solveur CPLEX."""
     I = prob.evaluate(A, detail=True)
-    print(f"Objectif = {I['obj']:.2f} | Coût = {I['cost']:.2f} | Faisable = {I['feasible']}")
-    print("Coûts par phase :", {k: round(v, 2) for k, v in I["G"].items()})
-    for name in ("P1", "P3", "P5"):
-        for dock, nodes, veh, c, t in I[name]:
-            print(f"{name} : D{dock} -> {nodes} -> D{dock} (véhicule {veh}, coût {c:.2f}, durée {t:.2f})")
-    for phase in ("P2", "P4"):
-        print(f"{phase} : camions = {I['trucks2' if phase == 'P2' else 'trucks4']}")
-        print(f"{phase} : quantités = {I['flow2' if phase == 'P2' else 'flow4']}")
-    print("Temps de fin :", {k: [round(x, 2) for x in v] for k, v in I["tau"].items()})
-    print(f"Durée totale = {I['duree_operations']:.2f} {unite_temps} / Tmax = {prob.Tmax:g}")
+    print("\n" + "=" * 56)
+    if I["feasible"]:
+        print("MEILLEURE SOLUTION FAISABLE")
+    else:
+        print("MEILLEURE SOLUTION NON FAISABLE")
+    if methode is not None:
+        print(f"Meilleure methode : {methode.upper()}")
+    if I["feasible"]:
+        print(f"Cout total : {I['cost']:.3f}")
+    else:
+        print(f"Objectif penalise : {I['obj']:.3f}")
+        print(f"Cout hors penalites : {I['cost']:.3f}")
+    print(f"Duree des operations : {I['duree_operations']:.3f} {unite_temps}".rstrip())
+    print("Couts par processus :")
+    for nom in ("P1", "P2", "P3", "P4", "P5"):
+        print(f"  {nom} : {I['G'][nom]:.3f}")
+    print("Tournees et transferts (numerotation OPL) :")
+    for nom in ("P1", "P2", "P3", "P4", "P5"):
+        if nom in ("P2", "P4"):
+            cle = "trucks2" if nom == "P2" else "trucks4"
+            transferts = [(i, j, n) for (i, j), n in I[cle].items() if n > 0]
+            if not transferts:
+                print(f"  {nom} : Aucun trajet")
+            else:
+                for i, j, n in transferts:
+                    # Les heuristiques donnent le nombre de camions par liaison,
+                    # mais ne leur attribuent pas d'identifiants W individuels.
+                    vehicules = "vehicule" if n == 1 else "vehicules"
+                    print(f"  {nom} : {n} {vehicules} de transfert : D{i} -> D{j}")
+        else:
+            if not I[nom]:
+                print(f"  {nom} : Aucun trajet")
+            else:
+                prefixe = "C" if nom == "P3" else "S"
+                for dock, nodes, veh, _, _ in I[nom]:
+                    trajet = " -> ".join([f"D{dock}"] +
+                                         [f"{prefixe}{n - prob.nD}" for n in nodes] +
+                                         [f"D{dock}"])
+                    print(f"  {nom} : Vehicule V{veh} : {trajet}")
     if not I["feasible"]:
-        print(f"Violations : charge={I['viol_units']:.1f}, temps={I['viol_time']:.1f}")
+        print(f"Violations : charge={I['viol_units']:.3f}, "
+              f"temps={I['viol_time']:.3f} {unite_temps}".rstrip())
+    if duree is not None:
+        nom = f" {methode.upper()}" if methode is not None else ""
+        print(f"Temps de calcul{nom} : {duree:.3f} s")
+    print("=" * 56)
     return I
-
-SECONDES_PAR_METHODE = 20
-
-def exporter_dat_pour_cplex(donnees, chemin, set_id, graine):
-    """Export CPLEX avec conversion des temps en minutes."""
-    from hf_vrpmfrcd_instances import UNITES_TEMPS, write_dat
-    import re
-    unite, facteur = UNITES_TEMPS[set_id]
-    write_dat(donnees, str(chemin), f"Set {set_id}, graine {graine}",
-              facteur_temps=facteur, unite_source=unite)
-    texte = chemin.read_text(encoding="utf-8")
-    correspondance = {
-        "bigM": "BigM", "tmax": "Tmax", "qV": "Q", "uV": "u",
-        "qsetW": "QW", "usetW": "uW", "hD": "h", "df": "d", "pr": "pret"
-    }
-    for origine, destination in correspondance.items():
-        texte = re.sub(r"\b" + re.escape(origine) + r"(?=\s*=)", destination, texte)
-    chemin.write_text(texte, encoding="utf-8")
 
 def demander_entier(invite, minimum, maximum=None):
     while True:
@@ -555,32 +619,36 @@ def demander_entier(invite, minimum, maximum=None):
             pass
         print("Saisie incorrecte : veuillez entrer un entier autorisé.")
 
-def demander_oui_non(message):
+def demander_limite():
     while True:
-        r = input(message).strip().lower()
-        if r in ("o", "oui", "y", "yes"): return True
-        if r in ("n", "non", "", "no"): return False
-        print("Répondre par o (oui) ou n (non).")
+        try:
+            valeur = float(input("Duree maximale de calcul par methode : ").strip().replace(",", "."))
+            if math.isfinite(valeur) and valeur > 0:
+                return valeur
+        except ValueError:
+            pass
+        print("Entrez une duree strictement positive (en secondes).")
+
 
 def main():
     from hf_vrpmfrcd_instances import UNITES_TEMPS, generate_instance, summary
-    print("=" * 65)
-    print("CL02 - Comparaison SA / SAVND / ANSA")
-    print("Version controle :", VERSION_CONTROLE)
-    print("Fichier execute :", Path(__file__).resolve())
-    print("=" * 65)
-    set_id = demander_entier("Choisir un Set (1 à 5, 0 pour quitter) : ", 0, 5)
-    if set_id == 0:
-        return
-    seed = demander_entier("Graine de génération (entier >= 0) : ", 0)
+    print("=" * 56)
+    print("Comparaison SA / SAVND / ANSA")
+    print("=" * 56)
+    set_id = demander_entier("Choisir le Set (1 a 5) : ", 1, 5)
+    seed = demander_entier("Choisir la graine : ", 0)
+    limite = demander_limite()
     donnees = generate_instance(set_id, seed=seed)
     prob = Problem(**donnees)
     unite_temps = UNITES_TEMPS[set_id][0]
-    print("Instance :", summary(donnees, set_id))
+    print(f"\nINSTANCE SELECTIONNEE — Set {set_id} / graine {seed}")
+    print(summary(donnees, set_id))
+    print(f"Limite de calcul : {limite} s")
+    print()
     resultats = []
 
     for methode in ("sa", "savnd", "ansa"):
-        reglages = quick_params(prob, seed=0, time_limit=SECONDES_PAR_METHODE)
+        reglages = quick_params(prob, seed=0, time_limit=limite)
         debut = time.perf_counter()
         solution, score, _, statistiques = solve(prob, methode, reglages)
         duree = time.perf_counter() - debut
@@ -606,16 +674,8 @@ def main():
 
     valides = [res for res in resultats if res[2]["feasible"]]
     meilleur = min(valides, key=lambda res: res[2]["cost"]) if valides else min(resultats, key=lambda res: res[2]["obj"])
-    print(f"\nMeilleure méthode : {meilleur[0].upper()}")
-    report(prob, meilleur[1], unite_temps=unite_temps)
-
-    if demander_oui_non("\nExporter les données vers CPLEX ? (o/n) : "):
-        chemin = Path(__file__).resolve().parent / f"Set{set_id}_graine{seed}_CPLEX.dat"
-        exporter_dat_pour_cplex(donnees, chemin, set_id, seed)
-        print("Fichier créé :", chemin)
+    report(prob, meilleur[1], unite_temps=unite_temps,
+           methode=meilleur[0], duree=meilleur[3])
 
 if __name__ == "__main__":
     main()
-
-
-
