@@ -11,25 +11,14 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from optimisation import (
-    METHODES, classement, executer_comparaison, facteur_minutes, generer_dat,
+    HEURISTIQUES, COULEURS_METHODES, COULEURS_PROCESSUS, methodes_disponibles,
+    classement, executer_comparaison, facteur_minutes, itineraires,
     graphe_flux_simplifie, tableau_comparaison, tableau_tournees, tableau_transferts
 )
 
 # =====================================================================
 # COULEURS
 # =====================================================================
-COULEURS_METHODES = {
-    "SA": "#F28E2B",       # Orange
-    "SAVND": "#59A14F",    # Vert
-    "ANSA": "#4E79A7"      # Bleu
-}
-COULEURS_PROCESSUS = {
-    "P1": "#E15759",       # Rouge
-    "P2": "#F28E2B",       # Orange
-    "P3": "#D4A017",       # Jaune dore (lisible sur fond clair)
-    "P4": "#269DAB",       # Bleu-vert
-    "P5": "#9467BD"        # Violet
-}
 NOMS_PROCESSUS = {
     "P1": "P1 · Collecte fournisseurs",
     "P2": "P2 · Transferts aller",
@@ -67,7 +56,7 @@ h2, h3 { color: #192D3C; }
 st.markdown("""
 <div class="eyebrow">Projet CL02 · Optimisation logistique</div>
 <h1 class="app-title">HF-VRPMFRCD <span style="font-weight:400;color:#80909D;">/</span> Dashboard</h1>
-<p class="app-subtitle">Comparaison des métaheuristiques SA, SAVND et ANSA sur un problème
+<p class="app-subtitle">Comparaison de SA, SAVND, ANSA et du modèle exact CPLEX (Sets 1–2) sur un problème
 de tournées de véhicules avec flotte hétérogène et cross-docks aller / retour.</p>
 """, unsafe_allow_html=True)
 
@@ -81,8 +70,6 @@ def ajouter_liaison(fig, positions, depart, arrivee, phase, etiquette="", descri
 
     x1, y1 = positions[depart]
     x2, y2 = positions[arrivee]
-    dx, dy = x2 - x1, y2 - y1
-    norme = max(math.hypot(dx, dy), 1e-9)
 
     # Perpendiculaire stable : meme orientation pour les deux sens d'une liaison.
     a, b = sorted((depart, arrivee))
@@ -142,63 +129,42 @@ def ajouter_liaison(fig, positions, depart, arrivee, phase, etiquette="", descri
 def construire_graphe_tournees(execution, resultat, phase_choisie, afficher_vehicules=True):
     """Graphe des trajets complets avec courbes et separation des arcs reutilises."""
     inst = execution["donnees"]
-    details = resultat["details"]
     schema = graphe_flux_simplifie(execution, resultat)
     if not schema["actif"]:
         return None, schema["raison"]
 
     positions = schema["positions"]
-    nD = inst["nD"]
     fig = go.Figure()
     compteurs = defaultdict(int)
 
-    # P1, P3 et P5 : chaque tournee est tracee entre ses noeuds successifs.
-    for phase in ("P1", "P3", "P5"):
-        if phase_choisie not in ("Toutes les phases", phase):
+    # Les chemins OPL de CPLEX ne sont jamais reconstruits en tournées heuristiques.
+    for route in itineraires(execution, resultat):
+        phase = route['phase']
+        if phase_choisie not in ('Toutes les phases', phase):
             continue
-
-        prefixe = "C" if phase == "P3" else "S"
-        for numero, (dock, noeuds, veh, cout, duree) in enumerate(details[phase], start=1):
-            chemin = [f"D{dock}"] + [f"{prefixe}{n - nD}" for n in noeuds] + [f"D{dock}"]
-            parcours = " → ".join(chemin)
-            capacite = inst["qV"][veh - 1] if 1 <= veh <= len(inst["qV"]) else "?"
-            description = (
-                f"{phase} · Tournée {numero}<br>Véhicule V{veh} · Capacité {capacite}"
-                f"<br>{parcours}<br>Coût : {cout:.2f}"
-                f"<br>Durée : {duree * facteur_minutes(execution['set_id']):.2f} min"
-            )
-
-            for indice_arc, (depart, arrivee) in enumerate(zip(chemin[:-1], chemin[1:])):
-                cle = (phase, *sorted((depart, arrivee)))
-                repetition = compteurs[cle]
-                compteurs[cle] += 1
-                montrer = afficher_vehicules and (phase_choisie != "Toutes les phases" or indice_arc == 0)
-                etiquette = f"V{veh}" if montrer else ""
-                ajouter_liaison(fig, positions, depart, arrivee, phase, etiquette, description, repetition)
-
-    # P2 et P4 : transferts entre cross-docks et quantites.
-    for phase, cle_flux, cle_camions in (
-        ("P2", "flow2", "trucks2"), ("P4", "flow4", "trucks4")
-    ):
-        if phase_choisie not in ("Toutes les phases", phase):
-            continue
-
-        transferts = details.get(cle_flux, {})
-        camions = details.get(cle_camions, {})
-        for (i, j), quantite in sorted(transferts.items()):
-            if quantite <= 0:
-                continue
-            depart, arrivee = f"D{i}", f"D{j}"
+        veh = route['veh']; chemin = route['labels']
+        description = (f"{phase} · Tournée {route['index']}<br>Véhicule V{veh} · Capacité {inst['qV'][veh-1]}"
+                       f"<br>{' → '.join(chemin)}<br>Coût : {route['cost']:.3f}"
+                       f"<br>Temps de trajet : {route['minutes']:.3f} min")
+        for indice_arc, (depart, arrivee) in enumerate(zip(chemin, chemin[1:])):
             cle = (phase, *sorted((depart, arrivee)))
-            repetition = compteurs[cle]
-            compteurs[cle] += 1
-            nb_camions = camions.get((i, j), 0)
-            description = (
-                f"{phase} · Transfert {depart} → {arrivee}"
-                f"<br>Quantité : {quantite:g}<br>Camions : {nb_camions}"
-            )
-            ajouter_liaison(fig, positions, depart, arrivee, phase,
-                            f"Q={quantite:g}", description, repetition)
+            repetition = compteurs[cle]; compteurs[cle] += 1
+            montrer = afficher_vehicules and (phase_choisie != 'Toutes les phases' or indice_arc == 0)
+            ajouter_liaison(fig, positions, depart, arrivee, phase, f'V{veh}' if montrer else '', description, repetition)
+
+    for phase in ('P2','P4'):
+        if phase_choisie not in ('Toutes les phases', phase):
+            continue
+        for liaison in tableau_transferts(execution, resultat, phase):
+            depart, arrivee = liaison['Origine'], liaison['Destination']
+            q = liaison['Quantité transférée']; n = liaison['Camions']
+            cle = (phase, *sorted((depart, arrivee)))
+            repetition = compteurs[cle]; compteurs[cle] += 1
+            qt = f'{q:g}' if q is not None else '—'
+            description = f'{phase} · {depart} → {arrivee}<br>Quantité : {qt}<br>Camions : {n}'
+            if liaison.get("Véhicules"):
+                description += "<br>" + liaison["Véhicules"]
+            ajouter_liaison(fig, positions, depart, arrivee, phase, f'Q={qt}', description, repetition)
 
     # Legende des processus.
     for phase in ("P1", "P2", "P3", "P4", "P5"):
@@ -243,24 +209,35 @@ def construire_graphe_tournees(execution, resultat, phase_choisie, afficher_vehi
 # =====================================================================
 with st.sidebar:
     st.markdown("### Configuration")
-    st.caption("Définissez une instance commune et le budget de recherche.")
-    with st.form("formulaire_optimisation"):
-        set_id = st.selectbox("Famille d'instances", [1, 2, 3, 4, 5], format_func=lambda x: f"Set {x}")
-        graine = st.number_input("Graine de génération", min_value=0, max_value=2_147_483_647, value=11, step=1)
-        secondes = st.slider("Temps maximal par méthode (s)", min_value=5, max_value=120, value=30, step=5)
-        methodes = st.multiselect("Méthodes à comparer", METHODES, default=list(METHODES))
-        lancer = st.form_submit_button("Lancer l'optimisation", type="primary", width="stretch")
+    st.caption("Définissez une instance commune et les durées de recherche.")
+    set_id = st.selectbox("Famille d'instances", [1, 2, 3, 4, 5], index=0, format_func=lambda x: f"Set {x}")
+    disponibles = methodes_disponibles(set_id)
+    methodes = st.multiselect("Méthodes à comparer", disponibles, default=list(HEURISTIQUES),
+                               key=f"cl02_methodes_{'petits' if set_id <= 2 else 'grands'}")
+    if set_id >= 3:
+        st.caption("Sets 3–5 : métaheuristiques uniquement.")
+    if any(m in HEURISTIQUES for m in methodes):
+        secondes = st.number_input("Temps maximal par métaheuristique (s)", min_value=1, value=20, step=5, format="%d")
+    else:
+        secondes = 20
+    if 'CPLEX' in methodes:
+        secondes_cplex = st.number_input("Temps maximal CPLEX (s)", min_value=1, value=120, step=10, format="%d")
+        st.caption("Limite de résolution, hors construction et post-traitement.")
+    else:
+        secondes_cplex = 120
+    graine = st.number_input("Graine de génération", min_value=0, max_value=2_147_483_647, value=11, step=1)
+    budget_total = sum(secondes for m in methodes if m in HEURISTIQUES) + (secondes_cplex if 'CPLEX' in methodes else 0)
+    st.caption(f"Durée maximale de recherche : {budget_total} s.")
+    lancer = st.button("Lancer l'optimisation", type="primary", use_container_width=True)
     st.divider()
     st.caption("**Méthode de calcul**")
-    st.caption("Une exécution par méthode, sur la même instance et avec la graine interne 0.")
-    st.caption("Les données CPLEX exportées sont toujours exprimées en minutes.")
+    st.caption("Une exécution par méthode, sur la même instance.")
+    st.caption("Les durées logistiques sont affichées en minutes.")
 
 # =====================================================================
 # EXECUTION DE L'OPTIMISATION
 # =====================================================================
 if lancer:
-    st.session_state.pop("execution_cl02", None)
-    st.session_state.pop("cl02_repetitions_avancees", None)
     if not methodes:
         st.warning("Sélectionnez au moins une méthode avant de lancer le calcul.")
     else:
@@ -272,13 +249,22 @@ if lancer:
 
                 def afficher_progres(numero, total, methode):
                     progression.progress(numero / total, text=f"{numero}/{total} méthodes terminées")
-                    suivi.write(f"✓ {methode} : calcul terminé")
+                    suivi.write(f"{methode} : traitement terminé")
 
                 execution = executer_comparaison(
                     set_id=int(set_id), graine=int(graine), methodes=methodes,
-                    secondes=float(secondes), progression=afficher_progres
+                    secondes=float(secondes), progression=afficher_progres,
+                    secondes_cplex=float(secondes_cplex)
                 )
+                execution["comparaison"] = tableau_comparaison(execution)
                 st.session_state["execution_cl02"] = execution
+                st.session_state.pop("cl02_repetitions_avancees", None)
+                st.session_state["cl02_figures"] = {}
+                st.session_state.pop("methode_tournees", None)
+                st.session_state.pop("cl02_methode_gantt_simple", None)
+                st.session_state.pop("adv_methodes", None)
+                st.session_state.pop("adv_repetitions", None)
+                st.session_state.pop("adv_budget", None)
                 statut.update(label="Optimisation terminée", state="complete", expanded=False)
         except Exception as exc:
             st.error(f"Le calcul n'a pas pu aboutir : {exc}")
@@ -296,7 +282,7 @@ if execution is None:
         st.caption("SA, SAVND et ANSA sur les mêmes données.")
     with c:
         st.markdown("**03 · Analyse**")
-        st.caption("Coûts, convergence, tournées et export CPLEX.")
+        st.caption("Coûts, convergence, tournées et données de l’instance.")
     st.stop()
 
 inst = execution["donnees"]
@@ -319,63 +305,77 @@ col5.metric("Flux aller / retour", f"{aller:,.0f} / {retour:,.0f}")
 col6.metric("Tmax", f"{tmax_min:,.0f} min".replace(",", " "))
 st.caption(
     f"Unités internes Python : {execution['unite_python']} · "
-    f"Temps maximal configuré : {execution['secondes']:g} s par méthode · "
-    "Temps des résultats affichés en minutes."
+    f"Temps maximal configuré : {execution['secondes']:g} s par méthode · " +
+    (f"Limite CPLEX : {execution['secondes_cplex']:g} s · " if any(r["methode"] == "CPLEX" for r in resultats) else "") +
+    "Durées logistiques affichées en minutes."
 )
 
-(onglet_bilan, onglet_convergence, onglet_tournees,
- onglet_chronologie, onglet_gain, onglet_export) = st.tabs([
-    "Vue d'ensemble", "Convergence", "Tournées et transferts",
-    "Chronologie", "Gain de l'optimisation", "Données et export"
-])
+for methode, erreur in execution.get('erreurs', {}).items():
+    st.error(f"{methode} : {erreur}")
+if not resultats:
+    st.warning("Aucun résultat disponible. Vérifiez les erreurs ci-dessus.")
+
+# Un seul onglet calculé à chaque interaction, contrairement à st.tabs classique.
+ONGLETS = ("Vue d'ensemble", "Convergence", "Tournées et transferts",
+           "Chronologie", "Gain de l'optimisation", "Données de l'instance")
+vue = st.radio("Navigation", ONGLETS, horizontal=True, label_visibility="collapsed", key="cl02_navigation")
 
 # =====================================================================
 # ONGLET 1 - VUE D'ENSEMBLE
 # =====================================================================
-with onglet_bilan:
+if vue == ONGLETS[0]:
     st.subheader("Comparaison des méthodes")
-    st.dataframe(pd.DataFrame(tableau_comparaison(execution)), hide_index=True, width="stretch")
-    if meilleur["details"]["feasible"]:
-        st.success(f"Meilleur coût parmi les solutions faisables : **{meilleur['methode']} — {meilleur['details']['cost']:,.2f}**")
+    st.dataframe(pd.DataFrame(execution["comparaison"]), hide_index=True, use_container_width=True)
+    if meilleur is None:
+        st.warning("Aucune solution disponible pour le classement.")
+    elif meilleur['details']['feasible']:
+        st.success(f"Plus faible coût parmi les solutions faisables selon leur modèle : **{meilleur['methode']} — {meilleur['details']['cost']:,.3f}**")
     else:
-        st.warning(f"Aucune solution déclarée faisable. Meilleur objectif pénalisé : **{meilleur['methode']}**.")
-
-    gauche, droite = st.columns([1, 1], gap="large")
+        st.warning(f"Aucune solution faisable trouvée. Meilleur objectif pénalisé : **{meilleur['methode']}**.")
+    st.caption("La faisabilité dépend du modèle utilisé ; un résultat heuristique n'est pas certifié par le MILP.")
+    comparables = [r for r in resultats if r['details']['feasible'] and r['details']['cost'] is not None]
+    gauche, droite = st.columns(2, gap='large')
     with gauche:
-        st.markdown("**Coût de transport par méthode**")
-        fig = go.Figure(go.Bar(
-            x=[r["methode"] for r in resultats],
-            y=[r["details"]["cost"] for r in resultats],
-            marker_color=[COULEURS_METHODES[r["methode"]] for r in resultats],
-            text=[f"{r['details']['cost']:,.1f}" for r in resultats],
-            textposition="outside",
-            hovertemplate="%{x}<br>Coût : %{y:.2f}<extra></extra>"
-        ))
-        fig.update_layout(
-            margin=dict(l=8, r=12, t=22, b=12), height=315,
-            yaxis_title="Coût de transport", xaxis_title="", showlegend=False,
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)"
-        )
-        st.plotly_chart(fig, width="stretch")
-        st.caption("SA en orange, SAVND en vert et ANSA en bleu.")
-
+        st.markdown("**Coûts de transport des solutions faisables**")
+        if comparables:
+            fig = go.Figure(go.Bar(x=[r['methode'] for r in comparables], y=[r['details']['cost'] for r in comparables],
+                marker_color=[COULEURS_METHODES[r['methode']] for r in comparables],
+                text=[f"{r['details']['cost']:,.3f}" for r in comparables], textposition='outside'))
+            fig.update_layout(height=315, margin=dict(l=8,r=12,t=22,b=12),yaxis_title='Coût de transport',showlegend=False)
+            st.plotly_chart(fig,use_container_width=True)
+        else:
+            st.info("Aucun coût faisable à comparer.")
     with droite:
-        st.markdown(f"**Répartition du coût · {meilleur['methode']}**")
-        couts = meilleur["details"]["G"]
-        fig = go.Figure(go.Bar(
-            x=list(couts.keys()), y=list(couts.values()),
-            marker_color=[COULEURS_PROCESSUS[p] for p in couts],
-            text=[f"{v:,.1f}" for v in couts.values()],
-            textposition="outside",
-            hovertemplate="%{x}<br>Coût : %{y:.2f}<extra></extra>"
-        ))
-        fig.update_layout(
-            margin=dict(l=8, r=12, t=22, b=12), height=315,
-            yaxis_title="Coût par processus", xaxis_title="", showlegend=False,
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)"
-        )
-        st.plotly_chart(fig, width="stretch")
-        st.caption("P1 rouge, P2 orange, P3 jaune, P4 bleu-vert et P5 violet.")
+        st.markdown("**Répartition du coût par processus**")
+        if meilleur is not None:
+            couts = meilleur['details']['G']
+            st.caption(meilleur['methode'] + ('' if meilleur['details']['feasible'] else ' · solution non faisable'))
+            fig = go.Figure(go.Bar(x=list(couts),y=list(couts.values()),marker_color=[COULEURS_PROCESSUS[p] for p in couts],
+                text=[f'{v:,.3f}' for v in couts.values()],textposition='outside'))
+            fig.update_layout(height=315,margin=dict(l=8,r=12,t=22,b=12),yaxis_title='Coût par processus',showlegend=False)
+            st.plotly_chart(fig,use_container_width=True)
+    cplex = next((r for r in resultats if r['methode']=='CPLEX'),None)
+    if cplex is not None:
+        st.divider(); st.subheader("Référence CPLEX")
+        st.write(f"Statut : **{cplex['statut']}** — {cplex.get('statut_brut') or '—'}")
+        def fmt(x, suffix=''):
+            return '—' if x is None else f'{x:,.3f}{suffix}'
+        cols=st.columns(3)
+        cols[0].metric('Coût CPLEX',fmt(cplex['details']['cost']))
+        cols[1].metric('Meilleure borne',fmt(cplex['borne']))
+        cols[2].metric('Gap relatif',fmt(cplex['gap']*100 if cplex['gap'] is not None else None,' %'))
+        cols=st.columns(4)
+        for col,cle,nom in zip(cols,('temps_construction','duree_calcul','temps_posttraitement','duree_totale'),('Construction','Résolution coût','Post-traitement','Total réel')):
+            col.metric(nom,fmt(cplex.get(cle),' s'))
+        st.caption(f"MILP initial : {cplex.get('variables')} variables, {cplex.get('contraintes')} contraintes. Le total inclut l'extraction et les surcoûts Python.")
+        ref=cplex['details']['cost']
+        if ref is not None and ref > 0:
+            rows=[{'Méthode':r['methode'],'Coût':round(r['details']['cost'],3),
+                   'Écart au coût CPLEX (%)':round(100*(r['details']['cost']-ref)/ref,4)}
+                  for r in comparables if r['methode'] in HEURISTIQUES]
+            if rows:
+                st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
+                st.caption("Écart descriptif au coût CPLEX, même si l'optimum MILP est prouvé : l'équivalence des domaines faisables n'est pas établie. Ce n'est pas une certification d'optimalité heuristique.")
 
     # Analyse statistique de robustesse, conservee en bas de la Vue d'ensemble.
     st.divider()
@@ -384,7 +384,7 @@ with onglet_bilan:
 # =====================================================================
 # ONGLET 2 - CONVERGENCE
 # =====================================================================
-with onglet_convergence:
+if vue == ONGLETS[1]:
     st.subheader("Évolution du meilleur objectif pénalisé")
     st.caption("Un point est enregistré lorsqu'une nouvelle meilleure solution est trouvée.")
     fig = go.Figure()
@@ -405,138 +405,150 @@ with onglet_convergence:
         height=440, hovermode="x unified", margin=dict(l=10, r=10, t=12, b=10),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)"
     )
-    st.plotly_chart(fig, width="stretch")
+    if fig.data:
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Aucun historique de recuit disponible.")
+    cplex = next((r for r in resultats if r["methode"] == "CPLEX"), None)
+    if cplex is not None:
+        st.caption(f"CPLEX : {cplex['statut']} · pas d’historique de convergence collecté.")
+        if cplex["details"]["cost"] is not None:
+            st.metric("Coût final CPLEX", f"{cplex['details']['cost']:,.3f}")
     st.info("La convergence représente l'objectif pénalisé utilisé pendant l'optimisation, et non le seul coût de transport.")
 
 # =====================================================================
 # ONGLET 3 - TOURNEES ET TRANSFERTS
 # =====================================================================
-with onglet_tournees:
+if vue == ONGLETS[2]:
     st.subheader("Détail de la solution")
-    noms_methodes = [r["methode"] for r in resultats]
-    choix = st.selectbox("Méthode à examiner", noms_methodes,
-                         index=noms_methodes.index(meilleur["methode"]), key="methode_tournees")
-    r = next(x for x in resultats if x["methode"] == choix)
-    d = r["details"]
-
-    a, b, c, dd = st.columns(4)
-    a.metric("Coût transport", f"{d['cost']:,.2f}")
-    b.metric("Objectif pénalisé", f"{d['obj']:,.2f}")
-    c.metric("Durée des opérations", f"{d['duree_operations'] * facteur:,.1f} min")
-    dd.metric("Horizon respecté", "Oui" if d["respecte_tmax"] else "Non")
-
-    st.markdown("**Représentation des tournées et des flux**")
-    if inst["nC"] + inst["nS"] + inst["nD"] <= 20:
-        col_phase, col_veh = st.columns([2, 1])
-        with col_phase:
-            phase_a_voir = st.selectbox(
-                "Processus à visualiser", ["Toutes les phases", "P1", "P2", "P3", "P4", "P5"],
-                key="phase_graphe"
-            )
-        with col_veh:
-            afficher_vehicules = st.checkbox("Afficher les véhicules", value=True, key="afficher_vehicules")
-
-        fig_reseau, erreur = construire_graphe_tournees(execution, r, phase_a_voir, afficher_vehicules)
-        if fig_reseau is not None:
-            st.plotly_chart(fig_reseau, width="stretch")
-            st.caption(
-                "Les flèches courbées représentent les liaisons successives des tournées calculées. "
-                "V1, V2… indiquent les véhicules ; Q indique les quantités transférées. "
-                "Survolez les courbes pour consulter les détails. Le schéma n'est pas à l'échelle."
-            )
-        else:
-            st.info(erreur)
+    avec_solution = [r for r in resultats if r['solution_disponible']]
+    if not avec_solution:
+        st.info("Aucune solution disponible.")
     else:
-        st.info("Schéma réservé aux petites instances pour préserver la lisibilité. Les tournées restent consultables dans le tableau.")
+        noms_methodes = [r["methode"] for r in avec_solution]
+        choix = st.selectbox("Méthode à examiner", noms_methodes,
+                             index=noms_methodes.index(meilleur["methode"]) if meilleur and meilleur["methode"] in noms_methodes else 0, key="methode_tournees")
+        r = next(x for x in resultats if x["methode"] == choix)
+        d = r["details"]
 
-    st.markdown("**Tournées P1, P3 et P5**")
-    tours = tableau_tournees(execution, r)
-    if tours:
-        st.dataframe(pd.DataFrame(tours), hide_index=True, width="stretch")
-    else:
-        st.caption("Aucune tournée enregistrée.")
+        a, b, c, dd = st.columns(4)
+        a.metric("Coût transport", f"{d['cost']:,.2f}")
+        b.metric("Objectif pénalisé", f"{d['obj']:,.2f}" if choix != "CPLEX" else "—")
+        c.metric("Fin P5" if choix == "CPLEX" else "Durée des opérations", f"{d['duree_operations'] * facteur:,.1f} min" if d["duree_operations"] is not None else "—")
+        dd.metric("Fin P5 ≤ Tmax" if choix == "CPLEX" else "Horizon respecté", "—" if d["respecte_tmax"] is None else ("Oui" if d["respecte_tmax"] else "Non"))
 
-    gauche, droite = st.columns(2, gap="large")
-    with gauche:
-        st.markdown("**P2 · Transferts aller**")
-        transferts = tableau_transferts(execution, r, "P2")
-        if transferts:
-            st.dataframe(pd.DataFrame(transferts), hide_index=True, width="stretch")
+        st.markdown("**Représentation des tournées et des flux**")
+        if inst["nC"] + inst["nS"] + inst["nD"] <= 20:
+            col_phase, col_veh = st.columns([2, 1])
+            with col_phase:
+                phase_a_voir = st.selectbox(
+                    "Processus à visualiser", ["Toutes les phases", "P1", "P2", "P3", "P4", "P5"],
+                    key="phase_graphe"
+                )
+            with col_veh:
+                afficher_vehicules = st.checkbox("Afficher les véhicules", value=True, key="afficher_vehicules")
+
+            cache = st.session_state.setdefault("cl02_figures", {})
+            cle = (choix, phase_a_voir, afficher_vehicules)
+            if cle not in cache:
+                cache[cle] = construire_graphe_tournees(execution, r, phase_a_voir, afficher_vehicules)
+            fig_reseau, erreur = cache[cle]
+            if fig_reseau is not None:
+                st.plotly_chart(fig_reseau, use_container_width=True)
+                st.caption(
+                    "Les flèches courbées représentent les liaisons successives des tournées calculées. "
+                    "V1, V2… indiquent les véhicules ; Q indique les quantités transférées. "
+                    "Survolez les courbes pour consulter les détails. Le schéma n'est pas à l'échelle."
+                )
+            else:
+                st.info(erreur)
         else:
-            st.caption("Aucun transfert entre cross-docks.")
-    with droite:
-        st.markdown("**P4 · Transferts retour**")
-        transferts = tableau_transferts(execution, r, "P4")
-        if transferts:
-            st.dataframe(pd.DataFrame(transferts), hide_index=True, width="stretch")
-        else:
-            st.caption("Aucun transfert entre cross-docks.")
+            st.info("Schéma réservé aux petites instances pour préserver la lisibilité. Les tournées restent consultables dans le tableau.")
 
-    with st.expander("Temps de fin des processus par cross-dock"):
-        tau = d["tau"]
-        tableau_tau = [
-            {"Cross-dock": f"D{i}", **{
-                phase: round(tau[phase][i - 1] * facteur, 2)
-                for phase in ("tau1", "tau2", "tau3", "tau4")
-            }}
-            for i in range(1, inst["nD"] + 1)
-        ]
-        st.dataframe(pd.DataFrame(tableau_tau), hide_index=True, width="stretch")
-        st.caption("Temps exprimés en minutes depuis le début des opérations.")
+        st.markdown("**Tournées P1, P3 et P5**")
+        tours = tableau_tournees(execution, r)
+        if tours:
+            st.dataframe(pd.DataFrame(tours), hide_index=True, use_container_width=True)
+        else:
+            st.caption("Aucune tournée enregistrée.")
+
+        gauche, droite = st.columns(2, gap="large")
+        with gauche:
+            st.markdown("**P2 · Transferts aller**")
+            transferts = tableau_transferts(execution, r, "P2")
+            if transferts:
+                st.dataframe(pd.DataFrame(transferts), hide_index=True, use_container_width=True)
+            else:
+                st.caption("Aucun transfert entre cross-docks.")
+        with droite:
+            st.markdown("**P4 · Transferts retour**")
+            transferts = tableau_transferts(execution, r, "P4")
+            if transferts:
+                st.dataframe(pd.DataFrame(transferts), hide_index=True, use_container_width=True)
+            else:
+                st.caption("Aucun transfert entre cross-docks.")
+
+        if d.get("tau") is not None:
+            with st.expander("Temps de fin des processus par cross-dock"):
+                tau = d["tau"]
+                tableau_tau = [
+                    {"Cross-dock": f"D{i}", **{
+                        phase: round(tau[phase][i - 1] * facteur, 2)
+                        for phase in ("tau1", "tau2", "tau3", "tau4")
+                    }}
+                    for i in range(1, inst["nD"] + 1)
+                ]
+                st.dataframe(pd.DataFrame(tableau_tau), hide_index=True, use_container_width=True)
+                st.caption("Temps exprimés en minutes depuis le début des opérations.")
 
 # =====================================================================
 # ONGLET 4 - CHRONOLOGIE
 # =====================================================================
-with onglet_chronologie:
+if vue == ONGLETS[3]:
     afficher_chronologie(execution)
 
 # =====================================================================
 # ONGLET 5 - GAIN DE L'OPTIMISATION
 # =====================================================================
-with onglet_gain:
+if vue == ONGLETS[4]:
     afficher_gain_optimisation(execution)
 
 # =====================================================================
 # ONGLET 6 - DONNEES ET EXPORT
 # =====================================================================
-with onglet_export:
+if vue == ONGLETS[5]:
     st.subheader("Données de l'instance et téléchargements")
-    st.write(
-        "Exportez **exactement l'instance utilisée dans cette exécution**. "
-        "Le fichier `.dat` est formaté pour `Projet_CL02.mod`, avec tous les temps en minutes."
-    )
-    try:
-        nom, contenu = generer_dat(execution)
-        st.download_button(
-            "Télécharger les données CPLEX (.dat)", data=contenu, file_name=nom,
-            mime="text/plain", type="primary", width="stretch"
-        )
-    except Exception as exc:
-        st.error(f"Impossible de produire le fichier .dat : {exc}")
-
-    csv = pd.DataFrame(tableau_comparaison(execution)).to_csv(
+    st.caption("Les résultats et matrices correspondent exactement à l'instance commune utilisée.")
+    csv = pd.DataFrame(execution["comparaison"]).to_csv(
         index=False, sep=";", decimal=","
     ).encode("utf-8-sig")
     st.download_button(
         "Télécharger la comparaison (.csv)", data=csv,
         file_name=f"Comparaison_Set{execution['set_id']}_graine{execution['graine']}.csv",
-        mime="text/csv", width="stretch"
+        mime="text/csv", use_container_width=True
     )
 
     with st.expander("Consulter les matrices de flux de l'instance"):
         if inst["nC"] * inst["nS"] > 10_000:
-            st.caption("Matrices volumineuses : utilisez le fichier .dat pour les consulter intégralement.")
+            st.caption("Matrices volumineuses : téléchargez les flux en CSV ci-dessous.")
         else:
             colonnes = [f"S{i}" for i in range(1, inst["nS"] + 1)]
             lignes_flux = [f"C{i}" for i in range(1, inst["nC"] + 1)]
             st.markdown("**Demandes (flux aller)**")
-            st.dataframe(pd.DataFrame(inst["df"], columns=colonnes, index=lignes_flux), width="stretch")
+            st.dataframe(pd.DataFrame(inst["df"], columns=colonnes, index=lignes_flux), use_container_width=True)
             st.markdown("**Retours**")
-            st.dataframe(pd.DataFrame(inst["pr"], columns=colonnes, index=lignes_flux), width="stretch")
+            st.dataframe(pd.DataFrame(inst["pr"], columns=colonnes, index=lignes_flux), use_container_width=True)
+
+    # Export des données utiles, sans conversion du modèle ni fichier temporaire.
+    colonnes = [f"S{i}" for i in range(1, inst["nS"] + 1)]
+    lignes_flux = [f"C{i}" for i in range(1, inst["nC"] + 1)]
+    for cle, libelle in (("df", "Demandes"), ("pr", "Retours")):
+        st.download_button(f"Télécharger {libelle.lower()} (.csv)",
+            pd.DataFrame(inst[cle],columns=colonnes,index=lignes_flux).to_csv(sep=";",decimal=",").encode("utf-8-sig"),
+            file_name=f"{libelle}_Set{execution['set_id']}_graine{execution['graine']}.csv",mime="text/csv")
 
 st.divider()
 st.caption(
     "CL02 · HF-VRPMFRCD · Résultats obtenus par les fonctions Python existantes. "
     "L'application ne remplace pas une vérification indépendante des contraintes du modèle exact."
 )
-
