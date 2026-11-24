@@ -1,7 +1,4 @@
 streamlit>=1.41,<2
 plotly>=5.24,<7
 pandas>=2.0,<3
-docplex
-cplex
-pyscipopt
 highspy
